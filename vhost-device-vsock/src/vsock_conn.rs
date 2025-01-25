@@ -392,7 +392,7 @@ mod tests {
     use std::ops::Deref;
     use std::sync::{Arc, Mutex};
     use virtio_bindings::bindings::virtio_ring::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
-    use virtio_queue::{mock::MockSplitQueue, Descriptor, DescriptorChain, Queue, QueueOwnedT};
+    use virtio_queue::{mock::MockSplitQueue, desc::Descriptor, desc::split::Descriptor as SplitDescriptor, DescriptorChain, Queue, QueueOwnedT};
     use vm_memory::{
         Address, Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryLoadGuard,
         GuestMemoryMmap,
@@ -448,8 +448,8 @@ mod tests {
         // let header = vec![0 as u8; head_params.head_len];
         let header = head_params.construct_head();
         let head_desc =
-            Descriptor::new(next_addr, head_params.head_len as u32, head_flags as u16, 1);
-        mem.write(&header, head_desc.addr()).unwrap();
+            Descriptor::from(SplitDescriptor::new(next_addr, head_params.head_len as u32, head_flags as u16, 1));
+        mem.write(&header, SplitDescriptor::from(head_desc).addr()).unwrap();
         assert!(virt_queue.desc_table().store(0, head_desc).is_ok());
         next_addr += head_params.head_len as u64;
 
@@ -469,8 +469,8 @@ mod tests {
             }
             // vsock data
             let data = vec![0_u8; head_data_len as usize];
-            let data_desc = Descriptor::new(next_addr, data.len() as u32, head_flags as u16, i + 2);
-            mem.write(&data, data_desc.addr()).unwrap();
+            let data_desc = Descriptor::from(SplitDescriptor::new(next_addr, data.len() as u32, head_flags as u16, i + 2));
+            mem.write(&data, SplitDescriptor::from(data_desc).addr()).unwrap();
             assert!(virt_queue.desc_table().store(i + 1, data_desc).is_ok());
             next_addr += head_data_len as u64;
         }
