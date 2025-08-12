@@ -7,6 +7,7 @@ use std::{
 };
 
 use log::{error, info};
+use mio::{Interest, Registry};
 use virtio_vsock::packet::{VsockPacket, PKT_HEADER_SIZE};
 use vm_memory::{bitmap::BitmapSlice, ReadVolatile, VolatileSlice, WriteVolatile};
 
@@ -49,7 +50,7 @@ pub(crate) struct VsockConnection<S> {
     /// The total number of bytes sent to the guest vsock driver.
     rx_cnt: Wrapping<u32>,
     /// epoll fd to which this connection's stream has to be added.
-    pub epoll_fd: RawFd,
+    pub epoll_fd: Option<Registry>,
     /// Local tx buffer.
     pub tx_buf: LocalTxBuf,
     /// Local tx buffer size
@@ -65,7 +66,7 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
         local_port: u32,
         guest_cid: u64,
         guest_port: u32,
-        epoll_fd: RawFd,
+        epoll_fd: Option<Registry>,
         tx_buffer_size: u32,
     ) -> Self {
         Self {
@@ -96,7 +97,7 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
         local_port: u32,
         guest_cid: u64,
         guest_port: u32,
-        epoll_fd: RawFd,
+        epoll_fd: Option<Registry>,
         peer_buf_alloc: u32,
         tx_buffer_size: u32,
     ) -> Self {
@@ -175,24 +176,26 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
                         // to the amount of data that was read.
                         pkt.set_op(VSOCK_OP_RW).set_len(read_cnt as u32);
 
-                        // Re-register the stream file descriptor for read and write events
-                        if VhostUserVsockThread::epoll_modify(
-                            self.epoll_fd,
-                            self.stream.as_raw_fd(),
-                            epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
-                        )
-                        .is_err()
-                        {
-                            if let Err(e) = VhostUserVsockThread::epoll_register(
-                                self.epoll_fd,
+                        if let Some(epoll_fd) = &self.epoll_fd {
+                            // Re-register the stream file descriptor for read and write events
+                            if VhostUserVsockThread::epoll_modify(
+                                epoll_fd,
                                 self.stream.as_raw_fd(),
-                                epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
-                            ) {
-                                // TODO: let's move this logic out of this func, and handle it
-                                // properly
-                                error!("epoll_register failed: {e:?}, but proceed further.");
-                            }
-                        };
+                                Interest::READABLE | Interest::WRITABLE,
+                            )
+                            .is_err()
+                            {
+                                if let Err(e) = VhostUserVsockThread::epoll_register(
+                                    epoll_fd,
+                                    self.stream.as_raw_fd(),
+                                    Interest::READABLE | Interest::WRITABLE,
+                                ) {
+                                    // TODO: let's move this logic out of this func, and handle it
+                                    // properly
+                                    error!("epoll_register failed: {e:?}, but proceed further.");
+                                }
+                            };
+                        }
                     }
 
                     // Update the rx_cnt with the amount of data in the vsock packet.
@@ -260,24 +263,25 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
             }
             VSOCK_OP_CREDIT_UPDATE => {
                 // Already updated the credit
-
-                // Re-register the stream file descriptor for read and write events
-                if VhostUserVsockThread::epoll_modify(
-                    self.epoll_fd,
-                    self.stream.as_raw_fd(),
-                    epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
-                )
-                .is_err()
-                {
-                    if let Err(e) = VhostUserVsockThread::epoll_register(
-                        self.epoll_fd,
+                if let Some(epoll_fd) = &self.epoll_fd {
+                    // Re-register the stream file descriptor for read and write events
+                    if VhostUserVsockThread::epoll_modify(
+                        epoll_fd,
                         self.stream.as_raw_fd(),
-                        epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
-                    ) {
-                        // TODO: let's move this logic out of this func, and handle it properly
-                        error!("epoll_register failed: {e:?}, but proceed further.");
-                    }
-                };
+                        Interest::READABLE | Interest::WRITABLE,
+                    )
+                    .is_err()
+                    {
+                        if let Err(e) = VhostUserVsockThread::epoll_register(
+                            epoll_fd,
+                            self.stream.as_raw_fd(),
+                            Interest::READABLE | Interest::WRITABLE,
+                        ) {
+                            // TODO: let's move this logic out of this func, and handle it properly
+                            error!("epoll_register failed: {e:?}, but proceed further.");
+                        }
+                    };
+                }
             }
             VSOCK_OP_CREDIT_REQUEST => {
                 // Send back this connection's credit information
@@ -346,17 +350,19 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
         }
 
         if written_count != buf.len() {
-            // Try to re-enable EPOLLOUT in case it is disabled when txbuf is empty.
-            if VhostUserVsockThread::epoll_modify(
-                self.epoll_fd,
-                self.stream.as_raw_fd(),
-                epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
-            )
-            .is_err()
-            {
-                error!("Failed to re-enable EPOLLOUT");
+            if let Some(epoll_fd) = &self.epoll_fd {
+                // Try to re-enable EPOLLOUT in case it is disabled when txbuf is empty.
+                if VhostUserVsockThread::epoll_modify(
+                    epoll_fd,
+                    self.stream.as_raw_fd(),
+                    Interest::READABLE | Interest::WRITABLE,
+                )
+                .is_err()
+                {
+                    error!("Failed to re-enable EPOLLOUT");
+                }
+                return self.tx_buf.push(&buf.offset(written_count).unwrap());
             }
-            return self.tx_buf.push(&buf.offset(written_count).unwrap());
         }
 
         Ok(())
@@ -632,7 +638,7 @@ mod tests {
             5000,
             3,
             5001,
-            -1,
+            None,
             CONN_TX_BUF_SIZE,
         );
 
@@ -655,7 +661,7 @@ mod tests {
             5000,
             3,
             5001,
-            -1,
+            None,
             65536,
             CONN_TX_BUF_SIZE,
         );
@@ -680,7 +686,7 @@ mod tests {
             5000,
             3,
             5001,
-            -1,
+            None,
             CONN_TX_BUF_SIZE,
         );
 
@@ -712,7 +718,7 @@ mod tests {
             5000,
             3,
             5001,
-            -1,
+            None,
             CONN_TX_BUF_SIZE,
         );
 
@@ -747,7 +753,7 @@ mod tests {
             5000,
             3,
             5001,
-            -1,
+            None,
             CONN_TX_BUF_SIZE,
         );
 
@@ -845,7 +851,7 @@ mod tests {
             5000,
             3,
             5001,
-            -1,
+            None,
             CONN_TX_BUF_SIZE,
         );
 

@@ -8,6 +8,7 @@ use std::{
 };
 
 use log::warn;
+use mio::Interest;
 use thiserror::Error as ThisError;
 use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
 use vhost_user_backend::{VhostUserBackend, VringRwLock};
@@ -17,8 +18,8 @@ use virtio_bindings::bindings::{
 };
 use vm_memory::{ByteValued, GuestMemoryAtomic, GuestMemoryMmap, Le64};
 use vmm_sys_util::{
-    epoll::EventSet,
-    eventfd::{EventFd, EFD_NONBLOCK},
+    event::{new_event_consumer_and_notifier, EventConsumer, EventFlag, EventNotifier},
+    eventfd::EventFd,
 };
 
 use crate::{thread_backend::RawPktsQ, vhu_vsock_thread::*};
@@ -258,7 +259,7 @@ pub(crate) struct VhostUserVsockBackend {
     queue_size: usize,
     pub threads: Vec<Mutex<VhostUserVsockThread>>,
     queues_per_thread: Vec<u64>,
-    pub exit_event: EventFd,
+    pub exit_event: (EventConsumer, EventNotifier),
 }
 
 impl VhostUserVsockBackend {
@@ -279,7 +280,8 @@ impl VhostUserVsockBackend {
             queue_size: config.get_queue_size(),
             threads: vec![thread],
             queues_per_thread,
-            exit_event: EventFd::new(EFD_NONBLOCK).map_err(Error::EventFdCreate)?,
+            exit_event: new_event_consumer_and_notifier(EventFlag::NONBLOCK)
+                .map_err(Error::EventFdCreate)?,
         })
     }
 }
@@ -323,14 +325,14 @@ impl VhostUserBackend for VhostUserVsockBackend {
     fn handle_event(
         &self,
         device_event: u16,
-        evset: EventSet,
+        evset: Interest,
         vrings: &[VringRwLock],
         thread_id: usize,
     ) -> IoResult<()> {
         let vring_rx = &vrings[0];
         let vring_tx = &vrings[1];
 
-        if evset != EventSet::IN {
+        if evset != Interest::READABLE {
             return Err(Error::HandleEventNotEpollIn.into());
         }
 
@@ -390,8 +392,14 @@ impl VhostUserBackend for VhostUserVsockBackend {
         self.queues_per_thread.clone()
     }
 
-    fn exit_event(&self, _thread_index: usize) -> Option<EventFd> {
-        self.exit_event.try_clone().ok()
+    fn exit_event(&self, _thread_index: usize) -> Option<(EventConsumer, EventNotifier)> {
+        // Some((self.exit_event.0.try_clone().unwrap(), self.exit_event.1.try_clone())_
+        let consumer = self.exit_event.0.try_clone().ok();
+        let notifier = self.exit_event.1.try_clone().ok();
+        match (consumer, notifier) {
+            (Some(c), Some(n)) => Some((c, n)),
+            _ => None,
+        }
     }
 }
 
@@ -447,18 +455,18 @@ mod tests {
 
         let exit = backend.exit_event(0);
         assert!(exit.is_some());
-        exit.unwrap().write(1).unwrap();
+        exit.unwrap().1.notify().unwrap();
 
-        let ret = backend.handle_event(RX_QUEUE_EVENT, EventSet::IN, &vrings, 0);
+        let ret = backend.handle_event(RX_QUEUE_EVENT, Interest::READABLE, &vrings, 0);
         ret.unwrap();
 
-        let ret = backend.handle_event(TX_QUEUE_EVENT, EventSet::IN, &vrings, 0);
+        let ret = backend.handle_event(TX_QUEUE_EVENT, Interest::READABLE, &vrings, 0);
         ret.unwrap();
 
-        let ret = backend.handle_event(EVT_QUEUE_EVENT, EventSet::IN, &vrings, 0);
+        let ret = backend.handle_event(EVT_QUEUE_EVENT, Interest::READABLE, &vrings, 0);
         ret.unwrap();
 
-        let ret = backend.handle_event(BACKEND_EVENT, EventSet::IN, &vrings, 0);
+        let ret = backend.handle_event(BACKEND_EVENT, Interest::READABLE, &vrings, 0);
         ret.unwrap();
     }
 
@@ -570,14 +578,14 @@ mod tests {
 
         assert_eq!(
             backend
-                .handle_event(RX_QUEUE_EVENT, EventSet::OUT, &vrings, 0)
+                .handle_event(RX_QUEUE_EVENT, Interest::WRITABLE, &vrings, 0)
                 .unwrap_err()
                 .to_string(),
             Error::HandleEventNotEpollIn.to_string()
         );
         assert_eq!(
             backend
-                .handle_event(SIBLING_VM_EVENT + 1, EventSet::IN, &vrings, 0)
+                .handle_event(SIBLING_VM_EVENT + 1, Interest::READABLE, &vrings, 0)
                 .unwrap_err()
                 .to_string(),
             Error::HandleUnknownEvent.to_string()
