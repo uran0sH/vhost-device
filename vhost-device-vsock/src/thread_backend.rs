@@ -13,6 +13,7 @@ use std::{
 };
 
 use log::{info, warn};
+use mio::{Interest, Registry};
 use virtio_vsock::packet::{VsockPacket, PKT_HEADER_SIZE};
 use vm_memory::{
     bitmap::BitmapSlice, ReadVolatile, VolatileMemoryError, VolatileSlice, WriteVolatile,
@@ -203,7 +204,7 @@ pub(crate) struct VsockThreadBackend {
     /// Host side socket info for listening to new connections from the host.
     backend_info: BackendType,
     /// epoll for registering new host-side connections.
-    epoll_fd: i32,
+    epoll_fd: Registry,
     /// CID of the guest.
     guest_cid: u64,
     /// Set of allocated local ports.
@@ -224,7 +225,7 @@ impl VsockThreadBackend {
     /// New instance of VsockThreadBackend.
     pub fn new(
         backend_info: BackendType,
-        epoll_fd: i32,
+        epoll_fd: Registry,
         guest_cid: u64,
         tx_buffer_size: u32,
         groups_set: Arc<RwLock<HashSet<String>>>,
@@ -280,7 +281,7 @@ impl VsockThreadBackend {
             self.listener_map.remove(&conn.stream.as_raw_fd());
             self.stream_map.remove(&conn.stream.as_raw_fd());
             self.local_port_set.remove(&conn.local_port);
-            VhostUserVsockThread::epoll_unregister(conn.epoll_fd, conn.stream.as_raw_fd())
+            VhostUserVsockThread::epoll_unregister(&conn.epoll_fd.unwrap(), conn.stream.as_raw_fd())
                 .unwrap_or_else(|err| {
                     warn!(
                         "Could not remove epoll listener for fd {:?}: {:?}",
@@ -388,7 +389,7 @@ impl VsockThreadBackend {
             self.listener_map.remove(&conn.stream.as_raw_fd());
             self.stream_map.remove(&conn.stream.as_raw_fd());
             self.local_port_set.remove(&conn.local_port);
-            VhostUserVsockThread::epoll_unregister(conn.epoll_fd, conn.stream.as_raw_fd())
+            VhostUserVsockThread::epoll_unregister(&conn.epoll_fd.unwrap(), conn.stream.as_raw_fd())
                 .unwrap_or_else(|err| {
                     warn!(
                         "Could not remove epoll listener for fd {:?}: {:?}",
@@ -481,7 +482,7 @@ impl VsockThreadBackend {
             pkt.dst_port(),
             pkt.src_cid(),
             pkt.src_port(),
-            self.epoll_fd,
+            Some(self.epoll_fd.try_clone().unwrap()),
             pkt.buf_alloc(),
             self.tx_buffer_size,
         );
@@ -498,9 +499,9 @@ impl VsockThreadBackend {
         self.local_port_set.insert(pkt.dst_port());
 
         VhostUserVsockThread::epoll_register(
-            self.epoll_fd,
+            &self.epoll_fd,
             stream_fd,
-            epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
+            Interest::READABLE | Interest::WRITABLE,
         )?;
         Ok(())
     }
@@ -516,6 +517,7 @@ impl VsockThreadBackend {
 mod tests {
     use std::os::unix::net::UnixListener;
 
+    use mio::Poll;
     use tempfile::tempdir;
     use virtio_vsock::packet::{VsockPacket, PKT_HEADER_SIZE};
     #[cfg(feature = "backend_vsock")]
@@ -535,15 +537,16 @@ mod tests {
     fn test_vsock_thread_backend(backend_info: BackendType) {
         const CID: u64 = 3;
 
-        let epoll_fd = epoll::create(false).unwrap();
-
+        // let epoll_fd = epoll::create(false).unwrap();
+        let poller = Poll::new().unwrap();
+        let epoll_fd = poller.registry();
         let groups_set: HashSet<String> = vec![GROUP_NAME.to_string()].into_iter().collect();
 
         let cid_map: Arc<RwLock<CidMap>> = Arc::new(RwLock::new(HashMap::new()));
 
         let mut vtp = VsockThreadBackend::new(
             backend_info,
-            epoll_fd,
+            epoll_fd.try_clone().unwrap(),
             CID,
             CONN_TX_BUF_SIZE,
             Arc::new(RwLock::new(groups_set)),
@@ -674,7 +677,8 @@ mod tests {
         let sibling2_backend =
             Arc::new(VhostUserVsockBackend::new(sibling2_config, cid_map.clone()).unwrap());
 
-        let epoll_fd = epoll::create(false).unwrap();
+        let poller = Poll::new().unwrap();
+        let epoll_fd = poller.registry();
 
         let groups_set: HashSet<String> = vec!["groupA", "groupB", "group3"]
             .into_iter()
@@ -683,7 +687,7 @@ mod tests {
 
         let mut vtp = VsockThreadBackend::new(
             BackendType::UnixDomainSocket(vsock_socket_path),
-            epoll_fd,
+            epoll_fd.try_clone().unwrap(),
             CID,
             CONN_TX_BUF_SIZE,
             Arc::new(RwLock::new(groups_set)),
