@@ -28,9 +28,8 @@ use virtio_queue::{DescriptorChain, QueueOwnedT};
 use vm_memory::{
     ByteValued, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryLoadGuard, GuestMemoryMmap,
 };
-use vmm_sys_util::{
-    event::{new_event_consumer_and_notifier, EventConsumer, EventFlag, EventNotifier},
-    eventfd::{EventFd, EFD_NONBLOCK},
+use vmm_sys_util::event::{
+    new_event_consumer_and_notifier, EventConsumer, EventFlag, EventNotifier,
 };
 
 use crate::{
@@ -139,8 +138,8 @@ pub struct VhostUserConsoleBackend {
     pub stdin: Option<Box<dyn Read + Send + Sync>>,
     pub listener: Option<TcpListener>,
     pub stream: Option<Box<dyn ReadWrite + Send + Sync>>,
-    pub rx_event: EventFd,
-    pub rx_ctrl_event: EventFd,
+    pub rx_event: (EventConsumer, EventNotifier),
+    pub rx_ctrl_event: (EventConsumer, EventNotifier),
     pub exit_event: (EventConsumer, EventNotifier),
     mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
 }
@@ -168,8 +167,10 @@ impl VhostUserConsoleBackend {
             stdin: None,
             stream: None,
             listener: None,
-            rx_event: EventFd::new(EFD_NONBLOCK).map_err(|_| Error::EventFdFailed)?,
-            rx_ctrl_event: EventFd::new(EFD_NONBLOCK).map_err(|_| Error::EventFdFailed)?,
+            rx_event: new_event_consumer_and_notifier(EventFlag::NONBLOCK)
+                .map_err(|_| Error::EventFdFailed)?,
+            rx_ctrl_event: new_event_consumer_and_notifier(EventFlag::NONBLOCK)
+                .map_err(|_| Error::EventFdFailed)?,
             exit_event: new_event_consumer_and_notifier(EventFlag::NONBLOCK)
                 .map_err(|_| Error::EventFdFailed)?,
             mem: None,
@@ -416,7 +417,7 @@ impl VhostUserConsoleBackend {
             self.handle_control_msg(request)?;
 
             // trigger a kick to the CTRL_RT_QUEUE
-            self.rx_ctrl_event.write(1).unwrap();
+            self.rx_ctrl_event.1.notify().unwrap();
 
             vring
                 .add_used(desc_chain.head_index(), reader.bytes_read() as u32)
@@ -500,7 +501,7 @@ impl VhostUserConsoleBackend {
 
     /// Set self's VringWorker.
     pub fn set_vring_worker(&self, vring_worker: Arc<VringEpollHandler<Arc<RwLock<Self>>>>) {
-        let rx_event_fd = self.rx_event.as_raw_fd();
+        let rx_event_fd = self.rx_event.0.as_raw_fd();
         vring_worker
             .register_listener(
                 rx_event_fd,
@@ -509,7 +510,7 @@ impl VhostUserConsoleBackend {
             )
             .unwrap();
 
-        let rx_ctrl_event_fd = self.rx_ctrl_event.as_raw_fd();
+        let rx_ctrl_event_fd = self.rx_ctrl_event.0.as_raw_fd();
         vring_worker
             .register_listener(
                 rx_ctrl_event_fd,
@@ -655,7 +656,7 @@ impl VhostUserConsoleBackend {
                     for byte in buffer.iter().take(bytes_read) {
                         self.rx_data_fifo.add(*byte).unwrap();
                     }
-                    self.rx_event.write(1).unwrap();
+                    self.rx_event.1.notify().unwrap();
                 }
             }
             Err(e) => {
@@ -680,7 +681,7 @@ impl VhostUserConsoleBackend {
                     // and trigger an EventFd.
                     if self.ready_to_write {
                         self.rx_data_fifo.add(bytes[0]).unwrap();
-                        self.rx_event.write(1).unwrap();
+                        self.rx_event.1.notify().unwrap();
                     }
                 }
                 Ok(())
@@ -825,11 +826,11 @@ impl VhostUserBackendMut for VhostUserConsoleBackend {
                     }
                     QueueEvents::CTRL_TX_QUEUE => self.process_ctrl_tx_queue(vring),
                     QueueEvents::BACKEND_RX_EFD => {
-                        let _ = self.rx_event.read();
+                        let _ = self.rx_event.0.consume();
                         self.process_rx_queue(vring)
                     }
                     QueueEvents::BACKEND_CTRL_RX_EFD => {
-                        let _ = self.rx_ctrl_event.read();
+                        let _ = self.rx_ctrl_event.0.consume();
                         self.process_ctrl_rx_queue(vring)
                     }
                     other => Err(Error::HandleEventUnknown(other)),
@@ -848,11 +849,11 @@ impl VhostUserBackendMut for VhostUserConsoleBackend {
                 QueueEvents::CTRL_RX_QUEUE => self.process_ctrl_rx_queue(vring),
                 QueueEvents::CTRL_TX_QUEUE => self.process_ctrl_tx_queue(vring),
                 QueueEvents::BACKEND_RX_EFD => {
-                    let _ = self.rx_event.read();
+                    let _ = self.rx_event.0.consume();
                     self.process_rx_queue(vring)
                 }
                 QueueEvents::BACKEND_CTRL_RX_EFD => {
-                    let _ = self.rx_ctrl_event.read();
+                    let _ = self.rx_ctrl_event.0.consume();
                     self.process_ctrl_rx_queue(vring)
                 }
                 other => Err(Error::HandleEventUnknown(other)),
