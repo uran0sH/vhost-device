@@ -18,7 +18,7 @@ use log::{error, trace, warn};
 use queues::{IsQueue, Queue};
 use thiserror::Error as ThisError;
 use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
-use vhost_user_backend::{VhostUserBackendMut, VringEpollHandler, VringRwLock, VringT};
+use vhost_user_backend::{EventSet, VhostUserBackendMut, VringEpollHandler, VringRwLock, VringT};
 use virtio_bindings::bindings::{
     virtio_config::{VIRTIO_F_NOTIFY_ON_EMPTY, VIRTIO_F_VERSION_1},
     virtio_ring::{VIRTIO_RING_F_EVENT_IDX, VIRTIO_RING_F_INDIRECT_DESC},
@@ -28,8 +28,7 @@ use vm_memory::{
     ByteValued, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryLoadGuard, GuestMemoryMmap,
 };
 use vmm_sys_util::{
-    epoll::EventSet,
-    eventfd::{EventFd, EFD_NONBLOCK},
+    event::{new_event_consumer_and_notifier, EventConsumer, EventFlag, EventNotifier}, eventfd::{EventFd, EFD_NONBLOCK}
 };
 
 use crate::{
@@ -140,7 +139,7 @@ pub struct VhostUserConsoleBackend {
     pub stream: Option<Box<dyn ReadWrite + Send + Sync>>,
     pub rx_event: EventFd,
     pub rx_ctrl_event: EventFd,
-    pub exit_event: EventFd,
+    pub exit_event: (EventConsumer, EventNotifier),
     mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
 }
 
@@ -168,7 +167,7 @@ impl VhostUserConsoleBackend {
             listener: None,
             rx_event: EventFd::new(EFD_NONBLOCK).map_err(|_| Error::EventFdFailed)?,
             rx_ctrl_event: EventFd::new(EFD_NONBLOCK).map_err(|_| Error::EventFdFailed)?,
-            exit_event: EventFd::new(EFD_NONBLOCK).map_err(|_| Error::EventFdFailed)?,
+            exit_event: new_event_consumer_and_notifier(EventFlag::NONBLOCK).map_err(|_| Error::EventFdFailed)?,
             mem: None,
         })
     }
@@ -501,7 +500,7 @@ impl VhostUserConsoleBackend {
         vring_worker
             .register_listener(
                 rx_event_fd,
-                EventSet::IN,
+                EventSet::READABLE,
                 u64::from(QueueEvents::BACKEND_RX_EFD),
             )
             .unwrap();
@@ -510,23 +509,23 @@ impl VhostUserConsoleBackend {
         vring_worker
             .register_listener(
                 rx_ctrl_event_fd,
-                EventSet::IN,
+                EventSet::READABLE,
                 u64::from(QueueEvents::BACKEND_CTRL_RX_EFD),
             )
             .unwrap();
 
-        let exit_event_fd = self.exit_event.as_raw_fd();
+        let exit_event_fd = self.exit_event.0.as_raw_fd();
         vring_worker
             .register_listener(
                 exit_event_fd,
-                EventSet::IN,
+                EventSet::READABLE,
                 u64::from(QueueEvents::EXIT_EFD),
             )
             .unwrap();
 
         let epoll_fd = self.epoll_fd.as_raw_fd();
         vring_worker
-            .register_listener(epoll_fd, EventSet::IN, u64::from(QueueEvents::KEY_EFD))
+            .register_listener(epoll_fd, EventSet::READABLE, u64::from(QueueEvents::KEY_EFD))
             .unwrap();
 
         if self.controller.read().unwrap().backend == BackendType::Network {
@@ -534,7 +533,7 @@ impl VhostUserConsoleBackend {
             vring_worker
                 .register_listener(
                     listener_fd,
-                    EventSet::IN,
+                    EventSet::READABLE,
                     u64::from(QueueEvents::LISTENER_EFD),
                 )
                 .unwrap();
@@ -850,8 +849,13 @@ impl VhostUserBackendMut for VhostUserConsoleBackend {
         Ok(())
     }
 
-    fn exit_event(&self, _thread_index: usize) -> Option<EventFd> {
-        self.exit_event.try_clone().ok()
+    fn exit_event(&self, _thread_index: usize) -> Option<(EventConsumer, EventNotifier)> {
+        let consumer = self.exit_event.0.try_clone().ok();
+        let notifier = self.exit_event.1.try_clone().ok();
+        match (consumer, notifier) {
+            (Some(c), Some(n)) => Some((c, n)),
+            _ => None,
+        }
     }
 }
 
@@ -902,29 +906,29 @@ mod tests {
         let list_vrings = [vring.clone(), vring.clone(), vring.clone(), vring];
 
         vu_console_backend
-            .handle_event(QueueEvents::RX_QUEUE, EventSet::IN, &list_vrings, 0)
+            .handle_event(QueueEvents::RX_QUEUE, EventSet::READABLE, &list_vrings, 0)
             .unwrap();
 
         vu_console_backend
-            .handle_event(QueueEvents::TX_QUEUE, EventSet::IN, &list_vrings, 0)
+            .handle_event(QueueEvents::TX_QUEUE, EventSet::READABLE, &list_vrings, 0)
             .unwrap();
 
         vu_console_backend
-            .handle_event(QueueEvents::CTRL_RX_QUEUE, EventSet::IN, &list_vrings, 0)
+            .handle_event(QueueEvents::CTRL_RX_QUEUE, EventSet::READABLE, &list_vrings, 0)
             .unwrap();
 
         vu_console_backend
-            .handle_event(QueueEvents::CTRL_TX_QUEUE, EventSet::IN, &list_vrings, 0)
+            .handle_event(QueueEvents::CTRL_TX_QUEUE, EventSet::READABLE, &list_vrings, 0)
             .unwrap();
 
         vu_console_backend
-            .handle_event(QueueEvents::BACKEND_RX_EFD, EventSet::IN, &list_vrings, 0)
+            .handle_event(QueueEvents::BACKEND_RX_EFD, EventSet::READABLE, &list_vrings, 0)
             .unwrap();
 
         vu_console_backend
             .handle_event(
                 QueueEvents::BACKEND_CTRL_RX_EFD,
-                EventSet::IN,
+                EventSet::READABLE,
                 &list_vrings,
                 0,
             )
@@ -1368,7 +1372,7 @@ mod tests {
 
         vu_console_backend.ready_to_write = true;
         vu_console_backend
-            .handle_event(QueueEvents::KEY_EFD, EventSet::IN, &[vring], 0)
+            .handle_event(QueueEvents::KEY_EFD, EventSet::READABLE, &[vring], 0)
             .unwrap();
 
         let received_byte = vu_console_backend.rx_data_fifo.peek();
@@ -1398,7 +1402,7 @@ mod tests {
 
         vu_console_backend.ready_to_write = true;
         vu_console_backend
-            .handle_event(QueueEvents::KEY_EFD, EventSet::IN, &[vring], 0)
+            .handle_event(QueueEvents::KEY_EFD, EventSet::READABLE, &[vring], 0)
             .unwrap();
 
         let received_byte = vu_console_backend.rx_data_fifo.peek();

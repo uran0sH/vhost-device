@@ -23,12 +23,12 @@ env_logger = "0.11"
 epoll = "4.3"
 log = "0.4"
 thiserror = "2.0"
-vhost = { version = "0.14", features = ["vhost-user-backend"] }
-vhost-user-backend = "0.20"
+vhost = { git = "https://github.com/uran0sH/vhost", rev = "54d673aa851f16c4828a6a661179de6c892a4ad8", features = ["vhost-user-backend"] }
+vhost-user-backend = { git = "https://github.com/uran0sH/vhost", rev = "54d673aa851f16c4828a6a661179de6c892a4ad8" }
 virtio-bindings = "0.2.5"
 virtio-queue = "0.16"
 vm-memory = "0.16.1"
-vmm-sys-util = "0.14"
+vmm-sys-util = "0.15"
 
 [dev-dependencies]
 assert_matches = "1.5"
