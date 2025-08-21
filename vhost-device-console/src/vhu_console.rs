@@ -10,11 +10,12 @@ use std::{
     net::TcpListener,
     os::fd::{AsRawFd, RawFd},
     slice::from_raw_parts,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
 };
 
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use log::{error, trace, warn};
+use mio::{unix::SourceFd, Interest, Poll, Token};
 use queues::{IsQueue, Queue};
 use thiserror::Error as ThisError;
 use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
@@ -28,7 +29,8 @@ use vm_memory::{
     ByteValued, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryLoadGuard, GuestMemoryMmap,
 };
 use vmm_sys_util::{
-    event::{new_event_consumer_and_notifier, EventConsumer, EventFlag, EventNotifier}, eventfd::{EventFd, EFD_NONBLOCK}
+    event::{new_event_consumer_and_notifier, EventConsumer, EventFlag, EventNotifier},
+    eventfd::{EventFd, EFD_NONBLOCK},
 };
 
 use crate::{
@@ -129,7 +131,7 @@ pub struct VhostUserConsoleBackend {
     event_idx: bool,
     rx_ctrl_fifo: Queue<VirtioConsoleControl>,
     rx_data_fifo: Queue<u8>,
-    epoll_fd: i32,
+    epoll_fd: Mutex<Poll>,
     stream_fd: Option<i32>,
     pub ready: bool,
     pub ready_to_write: bool,
@@ -150,13 +152,14 @@ impl VhostUserConsoleBackend {
     pub const NUM_QUEUES: u16 = 4;
 
     pub fn new(max_queue_size: usize, controller: Arc<RwLock<ConsoleController>>) -> Result<Self> {
+        let poller = Poll::new().unwrap();
         Ok(Self {
             max_queue_size,
             controller,
             event_idx: false,
             rx_ctrl_fifo: Queue::new(),
             rx_data_fifo: Queue::new(),
-            epoll_fd: epoll::create(false).map_err(|_| Error::EpollFdCreate)?,
+            epoll_fd: Mutex::new(poller),
             stream_fd: None,
             acked_features: 0x0,
             ready: false,
@@ -167,7 +170,8 @@ impl VhostUserConsoleBackend {
             listener: None,
             rx_event: EventFd::new(EFD_NONBLOCK).map_err(|_| Error::EventFdFailed)?,
             rx_ctrl_event: EventFd::new(EFD_NONBLOCK).map_err(|_| Error::EventFdFailed)?,
-            exit_event: new_event_consumer_and_notifier(EventFlag::NONBLOCK).map_err(|_| Error::EventFdFailed)?,
+            exit_event: new_event_consumer_and_notifier(EventFlag::NONBLOCK)
+                .map_err(|_| Error::EventFdFailed)?,
             mem: None,
         })
     }
@@ -181,7 +185,7 @@ impl VhostUserConsoleBackend {
             let stdin: Box<dyn Read + Send + Sync> = Box::new(io::stdin());
             self.stdin = Some(stdin);
 
-            Self::epoll_register(self.epoll_fd.as_raw_fd(), stdin_fd, epoll::Events::EPOLLIN)
+            self.epoll_register(stdin_fd, Interest::READABLE)
                 .map_err(|_| Error::EpollAdd)?;
         } else {
             let listener = TcpListener::bind(tcpaddr_str).expect("asdasd");
@@ -523,9 +527,13 @@ impl VhostUserConsoleBackend {
             )
             .unwrap();
 
-        let epoll_fd = self.epoll_fd.as_raw_fd();
+        let epoll_fd = self.epoll_fd.lock().unwrap().as_raw_fd();
         vring_worker
-            .register_listener(epoll_fd, EventSet::READABLE, u64::from(QueueEvents::KEY_EFD))
+            .register_listener(
+                epoll_fd,
+                EventSet::READABLE,
+                u64::from(QueueEvents::KEY_EFD),
+            )
             .unwrap();
 
         if self.controller.read().unwrap().backend == BackendType::Network {
@@ -541,27 +549,38 @@ impl VhostUserConsoleBackend {
     }
 
     /// Register a file with an epoll to listen for events in evset.
-    pub fn epoll_register(epoll_fd: RawFd, fd: RawFd, evset: epoll::Events) -> Result<()> {
-        epoll::ctl(
-            epoll_fd,
-            epoll::ControlOptions::EPOLL_CTL_ADD,
-            fd,
-            epoll::Event::new(evset, fd as u64),
-        )
-        .map_err(|_| Error::EpollAdd)?;
+    pub fn epoll_register(&self, fd: RawFd, evset: Interest) -> Result<()> {
+        // epoll::ctl(
+        //     epoll_fd,
+        //     epoll::ControlOptions::EPOLL_CTL_ADD,
+        //     fd,
+        //     epoll::Event::new(evset, fd as u64),
+        // )
+        // .map_err(|_| Error::EpollAdd)?;
+        self.epoll_fd
+            .lock()
+            .unwrap()
+            .registry()
+            .register(&mut SourceFd(&fd), Token(fd as usize), evset)
+            .map_err(|_| Error::EpollAdd)?;
         Ok(())
     }
 
     /// Remove a file from the epoll.
-    pub fn epoll_unregister(epoll_fd: RawFd, fd: RawFd) -> Result<()> {
-        epoll::ctl(
-            epoll_fd,
-            epoll::ControlOptions::EPOLL_CTL_DEL,
-            fd,
-            epoll::Event::new(epoll::Events::empty(), 0),
-        )
-        .map_err(|_| Error::EpollRemove)?;
-
+    pub fn epoll_unregister(&self, fd: RawFd) -> Result<()> {
+        // epoll::ctl(
+        //     epoll_fd,
+        //     epoll::ControlOptions::EPOLL_CTL_DEL,
+        //     fd,
+        //     epoll::Event::new(epoll::Events::empty(), 0),
+        // )
+        // .map_err(|_| Error::EpollRemove)?;
+        self.epoll_fd
+            .lock()
+            .unwrap()
+            .registry()
+            .deregister(&mut SourceFd(&fd))
+            .map_err(|_| Error::EpollRemove)?;
         Ok(())
     }
 
@@ -579,11 +598,7 @@ impl VhostUserConsoleBackend {
                     println!("New connection on: {local_addr}");
                     let stream_raw_fd = stream.as_raw_fd();
                     self.stream_fd = Some(stream_raw_fd);
-                    if let Err(err) = Self::epoll_register(
-                        self.epoll_fd.as_raw_fd(),
-                        stream_raw_fd,
-                        epoll::Events::EPOLLIN,
-                    ) {
+                    if let Err(err) = self.epoll_register(stream_raw_fd, Interest::READABLE) {
                         warn!("Failed to register with epoll: {err:?}");
                     }
 
@@ -631,10 +646,7 @@ impl VhostUserConsoleBackend {
                         .local_addr()
                         .unwrap();
                     println!("Close connection on: {local_addr}");
-                    if let Err(err) = Self::epoll_unregister(
-                        self.epoll_fd.as_raw_fd(),
-                        self.stream_fd.expect("No stream fd"),
-                    ) {
+                    if let Err(err) = self.epoll_unregister(self.stream_fd.expect("No stream fd")) {
                         warn!("Failed to register with epoll: {err:?}");
                     }
                     return;
@@ -914,15 +926,30 @@ mod tests {
             .unwrap();
 
         vu_console_backend
-            .handle_event(QueueEvents::CTRL_RX_QUEUE, EventSet::READABLE, &list_vrings, 0)
+            .handle_event(
+                QueueEvents::CTRL_RX_QUEUE,
+                EventSet::READABLE,
+                &list_vrings,
+                0,
+            )
             .unwrap();
 
         vu_console_backend
-            .handle_event(QueueEvents::CTRL_TX_QUEUE, EventSet::READABLE, &list_vrings, 0)
+            .handle_event(
+                QueueEvents::CTRL_TX_QUEUE,
+                EventSet::READABLE,
+                &list_vrings,
+                0,
+            )
             .unwrap();
 
         vu_console_backend
-            .handle_event(QueueEvents::BACKEND_RX_EFD, EventSet::READABLE, &list_vrings, 0)
+            .handle_event(
+                QueueEvents::BACKEND_RX_EFD,
+                EventSet::READABLE,
+                &list_vrings,
+                0,
+            )
             .unwrap();
 
         vu_console_backend
